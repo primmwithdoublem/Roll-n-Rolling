@@ -42,6 +42,103 @@ do
     end
 end
 
+-- Excluded basic attack / shoot / throw / utility spell IDs (3.3.5a)
+local EXCLUDED_SPELL_IDS = {
+    [6603]  = true, -- Auto Attack
+    [5019]  = true, -- Shoot (Wand)
+    [3018]  = true, -- Shoot (Bow/Gun/Crossbow)
+    [2764]  = true, -- Throw
+    [43308] = true, -- Find Fish
+}
+
+-- Excluded basic attack / shoot / throw names (fallback if spellLink lacks ID)
+local EXCLUDED_SPELL_NAMES = {
+    ["auto attack"] = true,
+    ["shoot"]       = true,
+    ["throw"]       = true,
+}
+for _, globalKey in ipairs({ "ATTACK", "SHOOT", "THROW" }) do
+    local localized = _G[globalKey]
+    if type(localized) == "string" and localized ~= "" then
+        EXCLUDED_SPELL_NAMES[localized:lower()] = true
+    end
+end
+
+-- Profession & non-combat utility skill names / spell names to exclude
+local PROFESSION_KEYWORDS = {
+    ["alchemy"] = true,
+    ["blacksmithing"] = true,
+    ["enchanting"] = true,
+    ["engineering"] = true,
+    ["herbalism"] = true,
+    ["inscription"] = true,
+    ["jewelcrafting"] = true,
+    ["leatherworking"] = true,
+    ["mining"] = true,
+    ["skinning"] = true,
+    ["tailoring"] = true,
+    ["cooking"] = true,
+    ["first aid"] = true,
+    ["fishing"] = true,
+    ["riding"] = true,
+    ["smelting"] = true,
+    ["disenchant"] = true,
+    ["prospecting"] = true,
+    ["milling"] = true,
+    ["find herbs"] = true,
+    ["find minerals"] = true,
+    ["find treasure"] = true,
+    ["find fish"] = true,
+    ["basic campfire"] = true,
+    ["runeforging"] = true,
+}
+
+local function BuildPlayerProfessionSet()
+    local profs = {}
+    for k, v in pairs(PROFESSION_KEYWORDS) do
+        profs[k] = v
+    end
+    if GetNumSkillLines and GetSkillLineInfo then
+        for i = 1, GetNumSkillLines() do
+            local skillName, isHeader = GetSkillLineInfo(i)
+            if not isHeader and type(skillName) == "string" and skillName ~= "" then
+                local lower = skillName:lower()
+                if PROFESSION_KEYWORDS[lower] then
+                    profs[lower] = true
+                end
+            end
+        end
+    end
+    return profs
+end
+
+local function IsExcludedSpell(spellName, spellRank, spellId, tabName, profSet)
+    if spellId and EXCLUDED_SPELL_IDS[spellId] then
+        return true
+    end
+
+    local nameLower = type(spellName) == "string" and spellName:lower() or ""
+    if nameLower == "" or EXCLUDED_SPELL_NAMES[nameLower] then
+        return true
+    end
+
+    -- Exclude Racial abilities (in 3.3.5a spellRank is "Racial" or "Racial Passive")
+    if type(spellRank) == "string" and spellRank:lower():find("racial", 1, true) then
+        return true
+    end
+
+    -- Exclude Profession tabs or profession spells
+    local tabLower = type(tabName) == "string" and tabName:lower() or ""
+    if tabLower ~= "" and profSet[tabLower] then
+        return true
+    end
+    if profSet[nameLower] then
+        return true
+    end
+
+    return false
+end
+
 local function IsTexturePath(val)
     if type(val) ~= "string" then return false end
     local lower = val:lower()
@@ -500,6 +597,7 @@ local function CollectLearnedSpells()
     local isBaseline = (knownSpellNames == nil) or (not sessionReady)
     if knownSpellNames == nil then knownSpellNames = {} end
 
+    local profSet = BuildPlayerProfessionSet()
     local currentSpells = {}
     local seq = 0
 
@@ -511,7 +609,9 @@ local function CollectLearnedSpells()
             local spellLink = GetSpellLink and GetSpellLink(i, BOOKTYPE_SPELL)
             local spellId = spellLink and tonumber(spellLink:match("spell:(%d+)"))
 
-            if spellName and icon and not IsPassiveSpell(i, BOOKTYPE_SPELL) then
+            if spellName and icon
+                and not IsPassiveSpell(i, BOOKTYPE_SPELL)
+                and not IsExcludedSpell(spellName, spellRank, spellId, tabName, profSet) then
                 local key = spellName:lower()
                 currentSpells[key] = true
 
