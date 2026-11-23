@@ -918,6 +918,7 @@ function CollectLearnedTalents()
         for oldKey in pairs(knownTalentRanks) do
             if not currentRanks[oldKey] then
                 talentRecentOrder[oldKey] = nil
+                knownTalentRanks[oldKey] = nil
             end
         end
     end
@@ -998,6 +999,7 @@ function CollectLearnedSpells()
         for oldKey in pairs(knownSpellNames) do
             if not currentSpells[oldKey] then
                 spellRecentOrder[oldKey] = nil
+                knownSpellNames[oldKey] = nil
             end
         end
     end
@@ -1212,6 +1214,28 @@ local function ScheduleResizeReflow()
         resizeDebounceFrame.elapsed = 0
         resizeDebounceFrame:Show()
     end
+end
+
+local eventRefreshTimer = CreateFrame("Frame")
+eventRefreshTimer:Hide()
+eventRefreshTimer.elapsed = 0
+eventRefreshTimer:SetScript("OnUpdate", function(self, dt)
+    self.elapsed = self.elapsed + dt
+    if self.elapsed >= 0.15 then
+        self.elapsed = 0
+        self:Hide()
+        if mainFrame and mainFrame:IsShown() then
+            RefreshRollNRolling()
+        else
+            CollectLearnedTalents()
+            CollectLearnedSpells()
+        end
+    end
+end)
+
+local function ScheduleEventRefresh()
+    eventRefreshTimer.elapsed = 0
+    eventRefreshTimer:Show()
 end
 
 local function CreateMainWindow()
@@ -1460,7 +1484,7 @@ readyTimer:Hide()
 readyTimer.elapsed = 0
 readyTimer:SetScript("OnUpdate", function(self, dt)
     self.elapsed = self.elapsed + dt
-    if self.elapsed >= 1.5 then
+    if self.elapsed >= 0.5 then
         sessionReady = true
         self:SetScript("OnUpdate", nil)
         self:Hide()
@@ -1475,18 +1499,24 @@ loader:RegisterEvent("CHARACTER_POINTS_CHANGED")
 loader:RegisterEvent("PLAYER_TALENT_UPDATE")
 loader:RegisterEvent("TALENT_POINTS_CHANGE")
 loader:SetScript("OnEvent", function(_, event)
-    if event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
+    if event == "PLAYER_LOGIN" then
         GetCharLockStore()
         sessionReady = false
         readyTimer.elapsed = 0
         readyTimer:Show()
         CollectLearnedTalents()
         CollectLearnedSpells()
-    elseif mainFrame and mainFrame:IsShown() then
-        RefreshRollNRolling()
+    elseif event == "PLAYER_ENTERING_WORLD" then
+        GetCharLockStore()
+        if not knownTalentRanks or not knownSpellNames then
+            CollectLearnedTalents()
+            CollectLearnedSpells()
+        end
+        sessionReady = true
+        ScheduleEventRefresh()
     else
-        CollectLearnedTalents()
-        CollectLearnedSpells()
+        sessionReady = true
+        ScheduleEventRefresh()
     end
     CreateClasslessIconButton()
 end)
