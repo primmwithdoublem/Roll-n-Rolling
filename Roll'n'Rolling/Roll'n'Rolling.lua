@@ -5,20 +5,147 @@ local iconPool = {}
 local ICON_SIZE = 34
 local ICON_SPACING = 6
 local COLS = 12
-local MIN_WIDTH = 380
+local MIN_WIDTH = 460
 local MIN_HEIGHT = 240
 local MAX_WIDTH = 1100
 local MAX_HEIGHT = 900
 local unlearnMode = false
-local showLabels = false
+local viewMode = "grid" -- "grid", "labels", "list"
 
--- Session tracking so newly rolled spells/talents sort to the front
+-- Session tracking so newly rolled spells/talents appear in their own section
 local recentRollCounter = 0
 local knownTalentRanks = nil
 local knownSpellNames = nil
 local talentRecentOrder = {}
 local spellRecentOrder = {}
 local sessionReady = false
+
+-- Cached items & source metadata so resizing reflows smoothly without rescanning
+local cachedTalents = {}
+local cachedSpells = {}
+local classlessSourceCache = {}
+
+-- Per-character saved locks
+RollNRollingDB = RollNRollingDB or {}
+
+local function GetCharacterKey()
+    local name = UnitName and UnitName("player") or "Unknown"
+    local realm = GetRealmName and GetRealmName() or "Realm"
+    return name .. " - " .. realm
+end
+
+local function GetCharLockStore()
+    RollNRollingDB = RollNRollingDB or {}
+    RollNRollingDB.characters = RollNRollingDB.characters or {}
+    local key = GetCharacterKey()
+    local charData = RollNRollingDB.characters[key]
+    if type(charData) ~= "table" then
+        charData = { spells = {}, talents = {} }
+        RollNRollingDB.characters[key] = charData
+    end
+    charData.spells = charData.spells or {}
+    charData.talents = charData.talents or {}
+    return charData
+end
+
+local function GetLockKey(name, isTalent)
+    if type(name) ~= "string" or name == "" then return nil end
+    return name:lower()
+end
+
+local function BuildLockedLookup()
+    local store = GetCharLockStore()
+    local spellLocks = {}
+    local talentLocks = {}
+    for k, v in pairs(store.spells) do
+        if v == true then spellLocks[k] = true end
+    end
+    for k, v in pairs(store.talents) do
+        if v == true then talentLocks[k] = true end
+    end
+    return spellLocks, talentLocks
+end
+
+local function IsLocked(name, isTalent, spellLocks, talentLocks)
+    local key = GetLockKey(name, isTalent)
+    if not key then return false end
+    if spellLocks and talentLocks then
+        local bucket = isTalent and talentLocks or spellLocks
+        return bucket[key] == true
+    end
+    local store = GetCharLockStore()
+    local bucket = isTalent and store.talents or store.spells
+    return bucket[key] == true
+end
+
+local function ToggleLock(name, className, isTalent)
+    local key = GetLockKey(name, isTalent)
+    if not key then return false end
+    local store = GetCharLockStore()
+    local bucket = isTalent and store.talents or store.spells
+    bucket[key] = not bucket[key]
+    local nowLocked = bucket[key]
+    DEFAULT_CHAT_FRAME:AddMessage(
+        "|cff33ff99Roll'n'Rolling:|r "
+        .. (nowLocked and "|cff00ff00Locked|r " or "|cffffaa00Unlocked|r ")
+        .. "|cffffd100" .. (name or "Unknown") .. "|r"
+        .. (className and className ~= "" and (" (" .. className .. ")") or "")
+        .. "."
+    )
+    return nowLocked
+end
+
+local function LockAllCurrent()
+    local store = GetCharLockStore()
+    local talents = CollectLearnedTalents()
+    local spells = CollectLearnedSpells()
+    local lockedCount = 0
+
+    for _, t in ipairs(talents) do
+        local key = GetLockKey(t.name, true)
+        if key then
+            store.talents[key] = true
+            lockedCount = lockedCount + 1
+        end
+    end
+
+    for _, s in ipairs(spells) do
+        local key = GetLockKey(s.name, false)
+        if key then
+            store.spells[key] = true
+            lockedCount = lockedCount + 1
+        end
+    end
+
+    DEFAULT_CHAT_FRAME:AddMessage(
+        "|cff33ff99Roll'n'Rolling:|r |cff00ff00Locked all|r (" .. lockedCount .. " items) for this character."
+    )
+    RefreshRollNRolling()
+end
+
+local function UnlockAllCurrent()
+    local store = GetCharLockStore()
+    local unlockedCount = 0
+
+    for _, v in pairs(store.talents) do
+        if v == true then
+            unlockedCount = unlockedCount + 1
+        end
+    end
+    for _, v in pairs(store.spells) do
+        if v == true then
+            unlockedCount = unlockedCount + 1
+        end
+    end
+
+    store.talents = {}
+    store.spells = {}
+
+    DEFAULT_CHAT_FRAME:AddMessage(
+        "|cff33ff99Roll'n'Rolling:|r |cffffaa00Unlocked all|r (" .. unlockedCount .. " items) for this character."
+    )
+    RefreshRollNRolling()
+end
 
 local VALID_CLASSES = {}
 do
@@ -42,13 +169,12 @@ do
     end
 end
 
--- Excluded basic attack / shoot / throw / utility spell IDs (3.3.5a)
+-- Excluded basic attack / shoot / throw spell IDs (3.3.5a)
 local EXCLUDED_SPELL_IDS = {
-    [6603]  = true, -- Auto Attack
-    [5019]  = true, -- Shoot (Wand)
-    [3018]  = true, -- Shoot (Bow/Gun/Crossbow)
-    [2764]  = true, -- Throw
-    [43308] = true, -- Find Fish
+    [6603] = true, -- Auto Attack
+    [5019] = true, -- Shoot (Wand)
+    [3018] = true, -- Shoot (Bow/Gun/Crossbow)
+    [2764] = true, -- Throw
 }
 
 -- Excluded basic attack / shoot / throw names (fallback if spellLink lacks ID)
@@ -122,12 +248,10 @@ local function IsExcludedSpell(spellName, spellRank, spellId, tabName, profSet)
         return true
     end
 
-    -- Exclude Racial abilities (in 3.3.5a spellRank is "Racial" or "Racial Passive")
     if type(spellRank) == "string" and spellRank:lower():find("racial", 1, true) then
         return true
     end
 
-    -- Exclude Profession tabs or profession spells
     local tabLower = type(tabName) == "string" and tabName:lower() or ""
     if tabLower ~= "" and profSet[tabLower] then
         return true
@@ -147,9 +271,16 @@ local function IsTexturePath(val)
         or lower:find("%.blp$")
 end
 
+local function CleanText(val)
+    if type(val) ~= "string" then return nil end
+    local cleaned = val:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", ""):match("^%s*(.-)%s*$")
+    return (cleaned ~= "") and cleaned or nil
+end
+
 local function MatchClassName(text)
-    if type(text) ~= "string" or text == "" or IsTexturePath(text) then return nil end
-    local lower = text:lower()
+    local cleaned = CleanText(text)
+    if not cleaned or IsTexturePath(cleaned) then return nil end
+    local lower = cleaned:lower()
     if VALID_CLASSES[lower] then return VALID_CLASSES[lower] end
     for key, properName in pairs(VALID_CLASSES) do
         if lower:find(key, 1, true) then return properName end
@@ -157,13 +288,175 @@ local function MatchClassName(text)
     return nil
 end
 
-local function ResolveSourceClass(tabName, extraHint)
-    local matched = MatchClassName(tabName) or MatchClassName(extraHint)
-    if matched then return matched end
-    if type(tabName) == "string" and tabName ~= "" and not IsTexturePath(tabName) and tabName:lower() ~= "general" then
-        return tabName
+local function ParseTreeAndClassFromStrings(a, b)
+    local sa, sb = CleanText(a), CleanText(b)
+    if sa and sa:find("%s*-%s*") then
+        local left, right = sa:match("^(.-)%s*%-%s*(.+)$")
+        left, right = CleanText(left), CleanText(right)
+        local cls = MatchClassName(right) or MatchClassName(left)
+        if cls then
+            local tree = (cls == right) and left or right
+            if tree and tree:lower() == cls:lower() then tree = nil end
+            return tree, cls
+        end
+    end
+    if sb and sb:find("%s*-%s*") then
+        local left, right = sb:match("^(.-)%s*%-%s*(.+)$")
+        left, right = CleanText(left), CleanText(right)
+        local cls = MatchClassName(right) or MatchClassName(left)
+        if cls then
+            local tree = (cls == right) and left or right
+            if tree and tree:lower() == cls:lower() then tree = nil end
+            return tree, cls
+        end
+    end
+
+    local clsA = MatchClassName(sa)
+    local clsB = MatchClassName(sb)
+    if clsA then
+        return (sb and not IsTexturePath(sb) and sb:lower() ~= clsA:lower()) and sb or nil, clsA
+    end
+    if clsB then
+        return (sa and not IsTexturePath(sa) and sa:lower() ~= clsB:lower()) and sa or nil, clsB
+    end
+
+    return nil, nil
+end
+
+local function GetSavedSourceCache()
+    RollNRollingDB = RollNRollingDB or {}
+    RollNRollingDB.sourceCache = RollNRollingDB.sourceCache or {}
+    return RollNRollingDB.sourceCache
+end
+
+local function RecordClasslessEntry(entryName, treeName, className)
+    local cleanName = CleanText(entryName)
+    if not cleanName or IsTexturePath(cleanName) then return end
+
+    local parsedTree, parsedClass = ParseTreeAndClassFromStrings(treeName, className)
+    local finalClass = parsedClass or MatchClassName(className) or MatchClassName(treeName)
+    local finalTree = parsedTree
+    if not finalTree and treeName and not IsTexturePath(treeName) then
+        local tClean = CleanText(treeName)
+        if tClean and (not finalClass or tClean:lower() ~= finalClass:lower()) then
+            finalTree = tClean
+        end
+    end
+
+    if finalClass or finalTree then
+        local key = cleanName:lower()
+        local existing = classlessSourceCache[key] or {}
+        existing.className = finalClass or existing.className
+        existing.treeName = finalTree or existing.treeName
+        classlessSourceCache[key] = existing
+
+        local saved = GetSavedSourceCache()
+        saved[key] = {
+            className = existing.className,
+            treeName = existing.treeName,
+        }
+    end
+end
+
+local function ScrapeFontStringsFromRow(frame, entryName)
+    if not frame then return nil, nil end
+    local texts = {}
+    local entryLower = entryName and entryName:lower() or nil
+
+    local function collect(f, depth)
+        if not f or depth > 3 then return end
+        if f.GetRegions then
+            for _, region in ipairs({ f:GetRegions() }) do
+                if region and region.GetObjectType and region:GetObjectType() == "FontString" and region.GetText then
+                    local txt = CleanText(region:GetText())
+                    if txt and not IsTexturePath(txt) and txt:lower() ~= entryLower then
+                        table.insert(texts, txt)
+                    end
+                end
+            end
+        end
+        if f.GetChildren then
+            for _, child in ipairs({ f:GetChildren() }) do
+                collect(child, depth + 1)
+            end
+        end
+    end
+
+    collect(frame, 0)
+
+    for _, txt in ipairs(texts) do
+        local tree, cls = ParseTreeAndClassFromStrings(txt, nil)
+        if tree or cls then
+            return tree, cls
+        end
+    end
+    return nil, nil
+end
+
+local function RefreshClasslessSourceCache()
+    if not ClasslessFrame_Freepick then return end
+
+    local function scan(frame, depth)
+        if not frame or depth > 8 then return end
+        local data = (type(frame.talentData) == "table" and frame.talentData)
+            or (type(frame.spellData) == "table" and frame.spellData)
+            or nil
+
+        if type(data) == "table" then
+            local entryName = data.name or data.searchName
+            local rawSub = data.subText or data.source or data.className or data.class or data.tabName or data.treeName
+            local rawTree = data.treeName or data.specName or data.tabName
+            local tree, cls = ParseTreeAndClassFromStrings(rawTree, rawSub)
+            if not tree and not cls then
+                tree, cls = ScrapeFontStringsFromRow(frame, entryName)
+            end
+            RecordClasslessEntry(entryName, tree or rawTree, cls or rawSub)
+            if type(data.searchName) == "string" and data.searchName ~= entryName then
+                RecordClasslessEntry(data.searchName, tree or rawTree, cls or rawSub)
+            end
+        end
+
+        if frame.GetChildren then
+            for _, child in ipairs({ frame:GetChildren() }) do
+                scan(child, depth + 1)
+            end
+        end
+    end
+
+    scan(ClasslessFrame_Freepick, 0)
+end
+
+local function FormatSourceLabel(treeName, className, fallbackTabName)
+    local cleanClass = MatchClassName(className) or MatchClassName(fallbackTabName)
+    local cleanTree = CleanText(treeName)
+    if cleanTree and IsTexturePath(cleanTree) then cleanTree = nil end
+    if cleanTree and cleanClass and cleanTree:lower() == cleanClass:lower() then
+        cleanTree = nil
+    end
+
+    if cleanTree and cleanClass then
+        return string.format("%s - %s", cleanTree, cleanClass)
+    elseif cleanClass then
+        return cleanClass
+    elseif cleanTree then
+        return cleanTree
+    elseif fallbackTabName and CleanText(fallbackTabName) and not IsTexturePath(fallbackTabName)
+        and CleanText(fallbackTabName):lower() ~= "general" then
+        return CleanText(fallbackTabName)
     end
     return "Classless"
+end
+
+local function ResolveSourceFromNameAndTab(name, tabName, skipScan)
+    if not skipScan then
+        RefreshClasslessSourceCache()
+    end
+    local key = name and name:lower()
+    local cached = key and (classlessSourceCache[key] or GetSavedSourceCache()[key])
+    if cached then
+        return FormatSourceLabel(cached.treeName, cached.className, tabName)
+    end
+    return FormatSourceLabel(nil, nil, tabName)
 end
 
 local function FormatNameWithClass(name, className)
@@ -184,17 +477,6 @@ local function GetRowData(frame, expectTalent)
     if type(frame.spellData) == "table" then return frame.spellData end
     if type(frame.talentData) == "table" then return frame.talentData end
     return nil
-end
-
-local function ExtractRowIDs(data)
-    if type(data) ~= "table" then return {} end
-    local ids = {}
-    for _, key in ipairs({ "spellID", "currentSpellId", "spellId", "talentId", "talentID", "id" }) do
-        if data[key] then
-            ids[data[key]] = true
-        end
-    end
-    return ids
 end
 
 local function RowMatchesEntry(data, entry)
@@ -375,6 +657,15 @@ end
 local function TriggerNativeUnlearn(entry)
     if not entry then return end
 
+    if IsLocked(entry.name, entry.isTalent) then
+        DEFAULT_CHAT_FRAME:AddMessage(
+            "|cff33ff99Roll'n'Rolling:|r |cffffd100"
+            .. FormatNameWithClass(entry.name, entry.className)
+            .. "|r is |cff00ff00locked|r. Unlock it first if you want to unlearn it."
+        )
+        return
+    end
+
     if not ClasslessFrame_Freepick or not ClasslessFrame_Freepick:IsShown() then
         DEFAULT_CHAT_FRAME:AddMessage(
             "|cff33ff99Roll'n'Rolling:|r Open Classless first to unlearn |cffffd100"
@@ -432,19 +723,33 @@ local function GetIconButton(parent, index)
         btn:SetSize(ICON_SIZE, ICON_SIZE)
 
         local tex = btn:CreateTexture(nil, "ARTWORK")
-        tex:SetAllPoints(btn)
+        tex:SetSize(ICON_SIZE, ICON_SIZE)
+        tex:SetPoint("LEFT", btn, "LEFT", 0, 0)
         tex:SetTexCoord(0.08, 0.92, 0.08, 0.92)
         btn.icon = tex
 
         local border = btn:CreateTexture(nil, "BACKGROUND")
         border:SetTexture("Interface\\Buttons\\WHITE8X8")
-        border:SetPoint("TOPLEFT", -1, 1)
-        border:SetPoint("BOTTOMRIGHT", 1, -1)
+        border:SetPoint("TOPLEFT", tex, "TOPLEFT", -1, 1)
+        border:SetPoint("BOTTOMRIGHT", tex, "BOTTOMRIGHT", 1, -1)
         border:SetVertexColor(0.25, 0.25, 0.30, 1)
         btn.border = border
 
+        local rowBg = btn:CreateTexture(nil, "BACKGROUND")
+        rowBg:SetTexture("Interface\\Buttons\\WHITE8X8")
+        rowBg:SetAllPoints(btn)
+        rowBg:SetVertexColor(0.12, 0.12, 0.16, 0.75)
+        rowBg:Hide()
+        btn.rowBg = rowBg
+
+        local lockBadge = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
+        lockBadge:SetPoint("TOPLEFT", tex, "TOPLEFT", 2, -2)
+        lockBadge:SetText("|cff00ff00L|r")
+        lockBadge:Hide()
+        btn.lockBadge = lockBadge
+
         local count = btn:CreateFontString(nil, "OVERLAY", "NumberFontNormalSmall")
-        count:SetPoint("BOTTOMRIGHT", -2, 2)
+        count:SetPoint("BOTTOMRIGHT", tex, "BOTTOMRIGHT", -2, 2)
         btn.count = count
 
         local label = btn:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -455,7 +760,7 @@ local function GetIconButton(parent, index)
 
         btn:RegisterForDrag("LeftButton")
         btn:SetScript("OnDragStart", function(self)
-            if unlearnMode then return end
+            if unlearnMode or IsShiftKeyDown() then return end
             if self.spellBookId then
                 PickupSpell(self.spellBookId, BOOKTYPE_SPELL)
             elseif self.spellName then
@@ -463,7 +768,14 @@ local function GetIconButton(parent, index)
             end
         end)
 
-        btn:SetScript("OnClick", function(self)
+        btn:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+        btn:SetScript("OnClick", function(self, mouseButton)
+            if IsShiftKeyDown() or (mouseButton == "RightButton" and not unlearnMode) then
+                ToggleLock(self.spellName, self.className, self.isTalent)
+                ReflowRollNRolling()
+                return
+            end
+
             if not unlearnMode then return end
             TriggerNativeUnlearn({
                 name = self.spellName,
@@ -483,13 +795,23 @@ local function GetIconButton(parent, index)
             elseif self.talentTab and self.talentIndex then
                 GameTooltip:SetTalent(self.talentTab, self.talentIndex)
             end
+            local resolvedSource = ResolveSourceFromNameAndTab(self.spellName, self.className, false)
             GameTooltip:AddLine(" ")
-            GameTooltip:AddLine("|cff66ccffSource:|r " .. FormatNameWithClass(self.spellName, self.className))
+            GameTooltip:AddLine("|cff66ccffSource:|r " .. FormatNameWithClass(self.spellName, resolvedSource))
+            if self.isLocked then
+                GameTooltip:AddLine("|cff00ff00Locked (Saved for this character)|r")
+            end
             if self.isRecent then
                 GameTooltip:AddLine("|cff33ff99Recently Rolled|r")
             end
             if unlearnMode then
-                GameTooltip:AddLine("|cffff4444Unlearn Mode Active: Click to unlearn|r")
+                if self.isLocked then
+                    GameTooltip:AddLine("|cff00ff00Locked: Unlock before unlearning|r")
+                else
+                    GameTooltip:AddLine("|cffff4444Unlearn Mode Active: Click to unlearn|r")
+                end
+            else
+                GameTooltip:AddLine("|cffaaaaaaShift-Click or Right-Click to Lock/Unlock|r")
             end
             GameTooltip:Show()
         end)
@@ -502,6 +824,9 @@ local function GetIconButton(parent, index)
     end
 
     btn:SetParent(parent)
+    btn:SetSize(ICON_SIZE, ICON_SIZE)
+    btn.rowBg:Hide()
+    btn.lockBadge:Hide()
     btn.spellBookId = nil
     btn.spellName = nil
     btn.className = nil
@@ -511,25 +836,33 @@ local function GetIconButton(parent, index)
     btn.talentIndex = nil
     btn.isTalent = false
     btn.isRecent = false
+    btn.isLocked = false
     btn.count:SetText("")
+    btn.label:ClearAllPoints()
     btn.label:SetText("")
     btn.label:Hide()
     btn:Show()
     return btn
 end
 
-local function SortRecentFirst(list)
+local function SortSectionWithLockedAtEnd(list, prioritizeRecent, spellLocks, talentLocks)
     table.sort(list, function(a, b)
-        if a.recentOrder ~= b.recentOrder then
-            return a.recentOrder > b.recentOrder
+        local aLocked = IsLocked(a.name, a.isTalent, spellLocks, talentLocks)
+        local bLocked = IsLocked(b.name, b.isTalent, spellLocks, talentLocks)
+        if aLocked ~= bLocked then
+            return not aLocked
+        end
+        if prioritizeRecent and (a.recentOrder or 0) ~= (b.recentOrder or 0) then
+            return (a.recentOrder or 0) > (b.recentOrder or 0)
         end
         return a.baseOrder < b.baseOrder
     end)
 end
 
-local function CollectLearnedTalents()
+function CollectLearnedTalents()
     local results = {}
     if not GetNumTalentTabs or not GetNumTalents or not GetTalentInfo then
+        cachedTalents = results
         return results
     end
 
@@ -560,7 +893,7 @@ local function CollectLearnedTalents()
 
                 table.insert(results, {
                     name = name,
-                    className = ResolveSourceClass(tabName),
+                    className = ResolveSourceFromNameAndTab(name, tabName, true),
                     icon = iconTexture,
                     rankText = currentRank .. "/" .. (maxRank or currentRank),
                     talentTab = tab,
@@ -582,15 +915,16 @@ local function CollectLearnedTalents()
     end
 
     knownTalentRanks = currentRanks
-    SortRecentFirst(results)
+    cachedTalents = results
     return results
 end
 
-local function CollectLearnedSpells()
+function CollectLearnedSpells()
     local byName = {}
     local ordered = {}
 
     if not GetNumSpellTabs or not GetSpellTabInfo then
+        cachedSpells = ordered
         return ordered
     end
 
@@ -620,7 +954,7 @@ local function CollectLearnedSpells()
                     spellRecentOrder[key] = recentRollCounter
                 end
 
-                local resolvedClass = ResolveSourceClass(tabName)
+                local resolvedClass = ResolveSourceFromNameAndTab(spellName, tabName, true)
 
                 if not byName[spellName] then
                     seq = seq + 1
@@ -661,13 +995,15 @@ local function CollectLearnedSpells()
     end
 
     knownSpellNames = currentSpells
-    SortRecentFirst(ordered)
+    cachedSpells = ordered
     return ordered
 end
 
-local function ApplyBorderColor(btn, isRecent, defaultR, defaultG, defaultB)
-    if unlearnMode then
+local function ApplyBorderColor(btn, isRecent, isLocked, defaultR, defaultG, defaultB)
+    if unlearnMode and not isLocked then
         btn.border:SetVertexColor(0.90, 0.25, 0.25, 1)
+    elseif isLocked then
+        btn.border:SetVertexColor(0.20, 0.85, 0.35, 1)
     elseif isRecent then
         btn.border:SetVertexColor(0.35, 0.90, 0.95, 1)
     else
@@ -675,93 +1011,205 @@ local function ApplyBorderColor(btn, isRecent, defaultR, defaultG, defaultB)
     end
 end
 
-function RefreshRollNRolling()
+local function ConfigureItemView(btn, item, rowWidth)
+    local displayName = FormatNameWithClass(item.name, item.className)
+    if item.isLocked then
+        displayName = "|cff00ff00[Locked]|r " .. displayName
+    end
+
+    if viewMode == "list" then
+        btn:SetSize(rowWidth, ICON_SIZE)
+        btn.rowBg:Show()
+        btn.label:SetPoint("LEFT", btn.icon, "RIGHT", 10, 0)
+        btn.label:SetPoint("RIGHT", btn, "RIGHT", -8, 0)
+        btn.label:SetJustifyH("LEFT")
+        btn.label:SetWordWrap(false)
+        btn.label:SetText(displayName)
+        btn.label:Show()
+    elseif viewMode == "labels" then
+        btn:SetSize(ICON_SIZE, ICON_SIZE)
+        btn.label:SetPoint("TOP", btn.icon, "BOTTOM", 0, -2)
+        btn.label:SetWidth(ICON_SIZE + 28)
+        btn.label:SetJustifyH("CENTER")
+        btn.label:SetWordWrap(false)
+        btn.label:SetText(FormatNameWithClass(item.name, item.className))
+        btn.label:Show()
+    else
+        btn:SetSize(ICON_SIZE, ICON_SIZE)
+    end
+end
+
+local function GetViewButtonText()
+    if viewMode == "labels" then
+        return "|cff66ccffView: Labels|r"
+    elseif viewMode == "list" then
+        return "|cff66ccffView: List|r"
+    end
+    return "View: Grid"
+end
+
+local function PopulateIconSection(content, items, cols, hSpacing, vSpacing, startY, poolIdx, defaultR, defaultG, defaultB, availWidth, spellLocks, talentLocks)
+    local y = startY
+    for i, item in ipairs(items) do
+        poolIdx = poolIdx + 1
+        local btn = GetIconButton(content, poolIdx)
+        local col = (i - 1) % cols
+        local row = math.floor((i - 1) / cols)
+        btn:SetPoint("TOPLEFT", content, "TOPLEFT", 12 + col * (ICON_SIZE + hSpacing), y - row * (ICON_SIZE + vSpacing))
+        btn.icon:SetTexture(item.icon)
+
+        local locked = IsLocked(item.name, item.isTalent, spellLocks, talentLocks)
+        btn.isLocked = locked
+        if locked then
+            btn.lockBadge:Show()
+        end
+
+        ApplyBorderColor(btn, item.recentOrder > 0, locked, defaultR, defaultG, defaultB)
+        if item.rankText then
+            btn.count:SetText(item.rankText)
+        end
+        btn.spellBookId = item.spellBookId
+        btn.spellName = item.name
+        btn.className = item.className
+        btn.spellId = item.spellId
+        btn.ids = item.ids
+        btn.talentTab = item.talentTab
+        btn.talentIndex = item.talentIndex
+        btn.isTalent = item.isTalent
+        btn.isRecent = (item.recentOrder > 0)
+        ConfigureItemView(btn, item, availWidth)
+    end
+    local rows = math.max(1, math.ceil(#items / cols))
+    return poolIdx, y - rows * (ICON_SIZE + vSpacing)
+end
+
+-- Fast layout reflow from already-collected data (used during window resizing & lock toggles)
+function ReflowRollNRolling()
     if not mainFrame then return end
 
     for _, btn in ipairs(iconPool) do
         btn:Hide()
     end
 
+    local spellLocks, talentLocks = BuildLockedLookup()
     local content = mainFrame.content
-    local talents = CollectLearnedTalents()
-    local spells = CollectLearnedSpells()
 
-    local vSpacing = showLabels and (ICON_SPACING + 16) or ICON_SPACING
-    local hSpacing = showLabels and (ICON_SPACING + 26) or ICON_SPACING
+    local recentItems = {}
+    local learnedTalents = {}
+    local learnedSpells = {}
+
+    for _, t in ipairs(cachedTalents) do
+        if (t.recentOrder or 0) > 0 then
+            table.insert(recentItems, t)
+        else
+            table.insert(learnedTalents, t)
+        end
+    end
+
+    for _, s in ipairs(cachedSpells) do
+        if (s.recentOrder or 0) > 0 then
+            table.insert(recentItems, s)
+        else
+            table.insert(learnedSpells, s)
+        end
+    end
+
+    SortSectionWithLockedAtEnd(recentItems, true, spellLocks, talentLocks)
+    SortSectionWithLockedAtEnd(learnedTalents, false, spellLocks, talentLocks)
+    SortSectionWithLockedAtEnd(learnedSpells, false, spellLocks, talentLocks)
+
+    local isList = (viewMode == "list")
+    local isLabels = (viewMode == "labels")
+
+    local vSpacing = isLabels and (ICON_SPACING + 16) or ICON_SPACING
+    local hSpacing = isLabels and (ICON_SPACING + 26) or ICON_SPACING
     local availWidth = math.max(140, (mainFrame.scroll and mainFrame.scroll:GetWidth() or (mainFrame:GetWidth() - 34)) - 24)
-    local cols = math.max(3, math.floor((availWidth + hSpacing) / (ICON_SIZE + hSpacing)))
+    local cols = isList and 1 or math.max(3, math.floor((availWidth + hSpacing) / (ICON_SIZE + hSpacing)))
     content:SetWidth(availWidth)
 
-    mainFrame.talentHeader:SetText(string.format("Learned Talents (%d)", #talents))
-
     local poolIdx = 0
-    local yOffset = -28
+    local yOffset = -6
 
-    if #talents == 0 then
+    if #recentItems > 0 then
+        mainFrame.recentHeader:ClearAllPoints()
+        mainFrame.recentHeader:SetPoint("TOPLEFT", content, "TOPLEFT", 12, yOffset)
+        mainFrame.recentHeader:SetText(string.format("Recently Rolled (%d)", #recentItems))
+        mainFrame.recentHeader:Show()
+        yOffset = yOffset - 22
+
+        poolIdx, yOffset = PopulateIconSection(
+            content, recentItems, cols, hSpacing, vSpacing, yOffset, poolIdx,
+            0.35, 0.90, 0.95, availWidth, spellLocks, talentLocks
+        )
+        yOffset = yOffset - 14
+    else
+        mainFrame.recentHeader:Hide()
+    end
+
+    mainFrame.talentHeader:ClearAllPoints()
+    mainFrame.talentHeader:SetPoint("TOPLEFT", content, "TOPLEFT", 12, yOffset)
+    mainFrame.talentHeader:SetText(string.format("Learned Talents (%d)", #learnedTalents))
+    yOffset = yOffset - 22
+
+    if #learnedTalents == 0 then
         mainFrame.noTalentsText:Show()
         mainFrame.noTalentsText:SetPoint("TOPLEFT", content, "TOPLEFT", 12, yOffset)
         yOffset = yOffset - 26
     else
         mainFrame.noTalentsText:Hide()
-        for i, t in ipairs(talents) do
-            poolIdx = poolIdx + 1
-            local btn = GetIconButton(content, poolIdx)
-            local col = (i - 1) % cols
-            local row = math.floor((i - 1) / cols)
-            btn:SetPoint("TOPLEFT", content, "TOPLEFT", 12 + col * (ICON_SIZE + hSpacing), yOffset - row * (ICON_SIZE + vSpacing))
-            btn.icon:SetTexture(t.icon)
-            ApplyBorderColor(btn, t.recentOrder > 0, 0.85, 0.65, 0.15)
-            btn.count:SetText(t.rankText)
-            btn.spellName = t.name
-            btn.className = t.className
-            btn.spellId = t.spellId
-            btn.ids = t.ids
-            btn.talentTab = t.talentTab
-            btn.talentIndex = t.talentIndex
-            btn.isTalent = true
-            btn.isRecent = (t.recentOrder > 0)
-            if showLabels then
-                btn.label:SetText(FormatNameWithClass(t.name, t.className))
-                btn.label:Show()
-            end
-        end
-        yOffset = yOffset - math.ceil(#talents / cols) * (ICON_SIZE + vSpacing) - 14
+        poolIdx, yOffset = PopulateIconSection(
+            content, learnedTalents, cols, hSpacing, vSpacing, yOffset, poolIdx,
+            0.85, 0.65, 0.15, availWidth, spellLocks, talentLocks
+        )
+        yOffset = yOffset - 14
     end
 
     mainFrame.spellHeader:ClearAllPoints()
     mainFrame.spellHeader:SetPoint("TOPLEFT", content, "TOPLEFT", 12, yOffset)
-    mainFrame.spellHeader:SetText(string.format("Learned Active Spells (%d)", #spells))
-    yOffset = yOffset - 24
+    mainFrame.spellHeader:SetText(string.format("Learned Active Spells (%d)", #learnedSpells))
+    yOffset = yOffset - 22
 
-    for i, s in ipairs(spells) do
-        poolIdx = poolIdx + 1
-        local btn = GetIconButton(content, poolIdx)
-        local col = (i - 1) % cols
-        local row = math.floor((i - 1) / cols)
-        btn:SetPoint("TOPLEFT", content, "TOPLEFT", 12 + col * (ICON_SIZE + hSpacing), yOffset - row * (ICON_SIZE + vSpacing))
-        btn.icon:SetTexture(s.icon)
-        ApplyBorderColor(btn, s.recentOrder > 0, 0.25, 0.75, 0.40)
-        btn.spellBookId = s.spellBookId
-        btn.spellName = s.name
-        btn.className = s.className
-        btn.spellId = s.spellId
-        btn.ids = s.ids
-        btn.isTalent = false
-        btn.isRecent = (s.recentOrder > 0)
-        if showLabels then
-            btn.label:SetText(FormatNameWithClass(s.name, s.className))
-            btn.label:Show()
+    poolIdx, yOffset = PopulateIconSection(
+        content, learnedSpells, cols, hSpacing, vSpacing, yOffset, poolIdx,
+        0.25, 0.75, 0.40, availWidth, spellLocks, talentLocks
+    )
+
+    content:SetHeight(math.abs(yOffset) + 28)
+end
+
+function RefreshRollNRolling()
+    if not mainFrame then return end
+    RefreshClasslessSourceCache()
+    CollectLearnedTalents()
+    CollectLearnedSpells()
+    ReflowRollNRolling()
+end
+
+local resizeDebounceFrame = CreateFrame("Frame")
+resizeDebounceFrame:Hide()
+resizeDebounceFrame.elapsed = 0
+resizeDebounceFrame:SetScript("OnUpdate", function(self, dt)
+    self.elapsed = self.elapsed + dt
+    if self.elapsed >= 0.05 then
+        self.elapsed = 0
+        self:Hide()
+        if mainFrame and mainFrame:IsShown() then
+            ReflowRollNRolling()
         end
     end
+end)
 
-    local spellRows = math.max(1, math.ceil(#spells / cols))
-    content:SetHeight(math.abs(yOffset) + spellRows * (ICON_SIZE + vSpacing) + 28)
+local function ScheduleResizeReflow()
+    if mainFrame and mainFrame:IsShown() then
+        resizeDebounceFrame.elapsed = 0
+        resizeDebounceFrame:Show()
+    end
 end
 
 local function CreateMainWindow()
     if mainFrame then return mainFrame end
 
-    local width = 12 + COLS * (ICON_SIZE + ICON_SPACING) + 32
+    local width = math.max(MIN_WIDTH, 12 + COLS * (ICON_SIZE + ICON_SPACING) + 32)
     local f = CreateFrame("Frame", "RollNRollingFrame", UIParent)
     f:SetSize(width, 460)
     f:SetPoint("CENTER")
@@ -775,7 +1223,10 @@ local function CreateMainWindow()
     f:EnableMouse(true)
     f:RegisterForDrag("LeftButton")
     f:SetScript("OnDragStart", f.StartMoving)
-    f:SetScript("OnDragStop", f.StopMovingOrSizing)
+    f:SetScript("OnDragStop", function(self)
+        self:StopMovingOrSizing()
+        ReflowRollNRolling()
+    end)
     f:Hide()
 
     f:SetBackdrop({
@@ -790,35 +1241,53 @@ local function CreateMainWindow()
     close:SetPoint("TOPRIGHT", -2, -2)
 
     local refresh = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    refresh:SetSize(64, 20)
-    refresh:SetPoint("RIGHT", close, "LEFT", -4, 0)
+    refresh:SetSize(56, 20)
+    refresh:SetPoint("RIGHT", close, "LEFT", -3, 0)
     refresh:SetText("Refresh")
     refresh:SetScript("OnClick", RefreshRollNRolling)
 
-    local labelBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    labelBtn:SetSize(74, 20)
-    labelBtn:SetPoint("RIGHT", refresh, "LEFT", -4, 0)
-    labelBtn:SetText("Labels: OFF")
-    labelBtn:SetScript("OnClick", function(self)
-        showLabels = not showLabels
-        self:SetText(showLabels and "|cff66ccffLabels: ON|r" or "Labels: OFF")
-        RefreshRollNRolling()
+    local viewBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    viewBtn:SetSize(88, 20)
+    viewBtn:SetPoint("RIGHT", refresh, "LEFT", -3, 0)
+    viewBtn:SetText(GetViewButtonText())
+    viewBtn:SetScript("OnClick", function(self)
+        if viewMode == "grid" then
+            viewMode = "labels"
+        elseif viewMode == "labels" then
+            viewMode = "list"
+        else
+            viewMode = "grid"
+        end
+        self:SetText(GetViewButtonText())
+        ReflowRollNRolling()
     end)
 
     local modeBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    modeBtn:SetSize(96, 20)
-    modeBtn:SetPoint("RIGHT", labelBtn, "LEFT", -4, 0)
+    modeBtn:SetSize(84, 20)
+    modeBtn:SetPoint("RIGHT", viewBtn, "LEFT", -3, 0)
     modeBtn:SetText("Unlearn: OFF")
     modeBtn:SetScript("OnClick", function(self)
         unlearnMode = not unlearnMode
         self:SetText(unlearnMode and "|cffff4444Unlearn: ON|r" or "Unlearn: OFF")
         f:SetBackdropBorderColor(unlearnMode and 0.85 or 0.28, unlearnMode and 0.20 or 0.28, unlearnMode and 0.20 or 0.34, 1)
-        RefreshRollNRolling()
+        ReflowRollNRolling()
     end)
+
+    local unlockAllBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    unlockAllBtn:SetSize(72, 20)
+    unlockAllBtn:SetPoint("RIGHT", modeBtn, "LEFT", -3, 0)
+    unlockAllBtn:SetText("|cffffaa00Unlock All|r")
+    unlockAllBtn:SetScript("OnClick", UnlockAllCurrent)
+
+    local lockAllBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    lockAllBtn:SetSize(64, 20)
+    lockAllBtn:SetPoint("RIGHT", unlockAllBtn, "LEFT", -3, 0)
+    lockAllBtn:SetText("|cff00ff00Lock All|r")
+    lockAllBtn:SetScript("OnClick", LockAllCurrent)
 
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 12, -10)
-    title:SetPoint("RIGHT", modeBtn, "LEFT", -8, 0)
+    title:SetPoint("RIGHT", lockAllBtn, "LEFT", -6, 0)
     title:SetJustifyH("LEFT")
     title:SetWordWrap(false)
     title:SetText("Roll'n'Rolling")
@@ -833,8 +1302,15 @@ local function CreateMainWindow()
     scroll:SetScrollChild(content)
     f.content = content
 
+    local recentHeader = content:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    recentHeader:SetPoint("TOPLEFT", 12, -6)
+    recentHeader:SetTextColor(0.35, 0.90, 0.95)
+    recentHeader:Hide()
+    f.recentHeader = recentHeader
+
     local talentHeader = content:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     talentHeader:SetPoint("TOPLEFT", 12, -6)
+    talentHeader:SetTextColor(0.85, 0.65, 0.15)
     f.talentHeader = talentHeader
 
     local noTalentsText = content:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
@@ -843,6 +1319,7 @@ local function CreateMainWindow()
 
     local spellHeader = content:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     spellHeader:SetPoint("TOPLEFT", 12, -6)
+    spellHeader:SetTextColor(0.25, 0.75, 0.40)
     f.spellHeader = spellHeader
 
     -- Bottom-right resize handle
@@ -874,13 +1351,12 @@ local function CreateMainWindow()
     resizeBtn:SetScript("OnDragStop", function(self)
         self.icon:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
         f:StopMovingOrSizing()
-        RefreshRollNRolling()
+        resizeDebounceFrame:Hide()
+        ReflowRollNRolling()
     end)
 
-    f:SetScript("OnSizeChanged", function(self)
-        if self:IsShown() then
-            RefreshRollNRolling()
-        end
+    f:SetScript("OnSizeChanged", function()
+        ScheduleResizeReflow()
     end)
 
     tinsert(UISpecialFrames, "RollNRollingFrame")
@@ -902,9 +1378,31 @@ SLASH_ROLLNROLLING1 = "/rnr"
 SLASH_ROLLNROLLING2 = "/learned"
 SlashCmdList["ROLLNROLLING"] = ToggleMainWindow
 
+local function HookClasslessFrameEvents()
+    if not ClasslessFrame_Freepick or ClasslessFrame_Freepick._rnrHooked then
+        return ClasslessFrame_Freepick and ClasslessFrame_Freepick._rnrHooked ~= nil
+    end
+
+    ClasslessFrame_Freepick:HookScript("OnShow", function()
+        RefreshClasslessSourceCache()
+        if mainFrame and mainFrame:IsShown() then
+            RefreshRollNRolling()
+        end
+    end)
+
+    ClasslessFrame_Freepick._rnrHooked = true
+    return true
+end
+
 local function CreateClasslessIconButton()
-    if not ClasslessFrame_Freepick or ClasslessFrame_Freepick._rnrIconBtn then
-        return ClasslessFrame_Freepick and ClasslessFrame_Freepick._rnrIconBtn ~= nil
+    if not ClasslessFrame_Freepick then
+        return false
+    end
+
+    HookClasslessFrameEvents()
+
+    if ClasslessFrame_Freepick._rnrIconBtn then
+        return true
     end
 
     local btn = CreateFrame("Button", "RollNRollingClasslessIconBtn", ClasslessFrame_Freepick)
@@ -967,6 +1465,7 @@ loader:RegisterEvent("PLAYER_TALENT_UPDATE")
 loader:RegisterEvent("TALENT_POINTS_CHANGE")
 loader:SetScript("OnEvent", function(_, event)
     if event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
+        GetCharLockStore()
         sessionReady = false
         readyTimer.elapsed = 0
         readyTimer:Show()
@@ -988,6 +1487,7 @@ attachWatcher:SetScript("OnUpdate", function(self, dt)
     if self.elapsed < 0.25 then return end
     self.elapsed = 0
     if CreateClasslessIconButton() then
+        RefreshClasslessSourceCache()
         self:SetScript("OnUpdate", nil)
         self:Hide()
     end
