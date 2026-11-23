@@ -28,6 +28,14 @@ local classlessSourceCache = {}
 -- Per-character saved locks
 RollNRollingDB = RollNRollingDB or {}
 
+local function ClearRecentRolls()
+    recentRollCounter = 0
+    wipe(talentRecentOrder)
+    wipe(spellRecentOrder)
+    if CollectLearnedTalents then CollectLearnedTalents() end
+    if CollectLearnedSpells then CollectLearnedSpells() end
+end
+
 local function GetCharacterKey()
     local name = UnitName and UnitName("player") or "Unknown"
     local realm = GetRealmName and GetRealmName() or "Realm"
@@ -1226,6 +1234,9 @@ local function CreateMainWindow()
     f:SetScript("OnDragStop", function(self)
         self:StopMovingOrSizing()
         ReflowRollNRolling()
+    end)
+    f:SetScript("OnHide", function()
+        ClearRecentRolls()
     end)
     f:Hide()
 
